@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # Copyright SUSE LLC
 
 """check_last_signed_commit checks out a verified git commit to be used mainly in CI pipelines.

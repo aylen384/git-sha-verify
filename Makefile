@@ -1,4 +1,5 @@
 SOURCE_FILES ?= $(shell git ls-files "**.py")
+PYTHON_RUN ?=
 
 .PHONY: all
 all:
@@ -9,17 +10,21 @@ only-test:
 
 .PHONY: ruff
 ruff:
-	ruff check
-	ruff format --check
+	$(PYTHON_RUN) ruff check
+	$(PYTHON_RUN) ruff format --check
 
 .PHONY: tidy
 tidy:
-	ruff format
-	ruff check --fix
+	$(PYTHON_RUN) ruff format
+	$(PYTHON_RUN) ruff check --fix
 
 .PHONY: typecheck
 typecheck:
-	PYRIGHT_PYTHON_FORCE_VERSION=latest pyright --skipunannotated --warnings
+	$(PYTHON_RUN) ty check
+
+.PHONY: check-lock
+check-lock:
+	uv lock --check
 
 .PHONY: check-maintainability
 check-maintainability:
@@ -38,7 +43,7 @@ only-test-with-coverage:
 # aggregate targets
 
 .PHONY: checkstyle
-checkstyle: ruff typecheck check-maintainability check-code-health
+checkstyle: ruff typecheck check-maintainability check-code-health check-lock
 
 .PHONY: test
 test: only-test-with-coverage checkstyle

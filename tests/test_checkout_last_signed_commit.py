@@ -1,461 +1,482 @@
 # Copyright SUSE LLC
-import pathlib
-import unittest
-from typing import Any
-from unittest.mock import ANY, MagicMock, Mock, patch
+from __future__ import annotations
+
+import runpy
+import sys
+from collections.abc import Iterator
+from pathlib import Path
+from unittest.mock import MagicMock, Mock, call, patch
 
 import pytest
-from requests import RequestException
-from requests.exceptions import HTTPError
+from requests.exceptions import RequestException
 
 import checkout_last_signed_commit
 
 
-class Tests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.monkey_patch = pytest.MonkeyPatch()
+@pytest.fixture
+def repo_dir(tmp_path: Path) -> Path:
+    (tmp_path / ".git").mkdir(parents=True)
+    return tmp_path
 
-    def test_git_lab_gpg_key_fetcher_uninitialized(self) -> None:
-        self.monkey_patch.delenv(name="PRIVATE_TOKEN", raising=False)
-        with pytest.raises(SystemExit) as exc_info:
-            gpg_key_fetcher = checkout_last_signed_commit.GitLabGPGKeyFetcher()
-        assert exc_info.type is SystemExit
-        assert (
-            exc_info.value.code
-            == "Please set the environment variable PRIVATE_TOKEN for GitLab User API Authentication"
+
+@pytest.fixture
+def repo_and_mock(repo_dir: Path) -> Iterator[tuple[checkout_last_signed_commit.GitRepo, MagicMock]]:
+    with patch("checkout_last_signed_commit.git.Repo") as mock_cls:
+        repo = checkout_last_signed_commit.GitRepo(checkout_dir=str(repo_dir), branch="main")
+        yield repo, mock_cls.return_value
+
+
+@pytest.fixture
+def mock_main_deps(monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[MagicMock, MagicMock, MagicMock]]:
+    monkeypatch.setenv("PRIVATE_TOKEN", "fake_token")
+    with (
+        patch("checkout_last_signed_commit.GitRepo") as mock_repo_cls,
+        patch("checkout_last_signed_commit.GitLabUsers") as mock_users_cls,
+        patch("checkout_last_signed_commit.GPG") as mock_gpg_cls,
+    ):
+        yield mock_repo_cls.return_value, mock_users_cls.return_value, mock_gpg_cls.return_value
+
+
+def test_fatal_error() -> None:
+    with pytest.raises(SystemExit) as exc:
+        checkout_last_signed_commit.fatal_error("Critical failure")
+    assert exc.value.code == 1
+
+
+def test_gpg_clear_public_keys() -> None:
+    gpg = checkout_last_signed_commit.GPG()
+    gpg.list_keys = MagicMock(
+        side_effect=lambda **kw: (
+            [{"fingerprint": "SEC_FP"}]
+            if kw.get("secret")
+            else [{"fingerprint": "SEC_FP"}, {"fingerprint": "PUB_1"}, {"fingerprint": "PUB_2"}]
+        )
+    )
+    gpg.delete_keys = MagicMock()
+    gpg.clear_public_keys()
+    assert gpg.delete_keys.call_args_list == [call("PUB_1"), call("PUB_2")]
+
+
+@pytest.mark.parametrize(("token", "url"), [(None, None), ("val", "https://api.example.com/")])
+def test_gitlab_users_init(token: str | None, url: str | None) -> None:
+    kwargs = {k: v for k, v in [("private_token", token), ("user_api_url", url)] if v}
+    users = checkout_last_signed_commit.GitLabUsers(**kwargs)
+    assert users.private_token == token
+    assert users.user_api_url == (url or checkout_last_signed_commit.GITLAB_USER_API_DEFAULT)
+
+
+@pytest.mark.parametrize(
+    ("token", "endpoint", "kwargs"),
+    [
+        ("sample_val", "test/ep", {"timeout": 15}),
+        (None, "test/no_token", {}),
+    ],
+)
+@patch("requests.get")
+def test_gitlab_users_api_request(
+    mock_get: MagicMock,
+    token: str | None,
+    endpoint: str,
+    kwargs: dict[str, int],
+) -> None:
+    mock_resp = Mock()
+    mock_get.return_value = mock_resp
+    users = checkout_last_signed_commit.GitLabUsers(private_token=token)
+    assert users._api_request(endpoint, **kwargs) == mock_resp  # ruff: ignore[private-member-access]
+    mock_resp.raise_for_status.assert_called_once()
+    mock_get.assert_called_once_with(
+        url=f"https://gitlab.suse.de/api/v4/users/{endpoint}",
+        timeout=kwargs.get("timeout", 10),
+        headers={"PRIVATE-TOKEN": token} if token else None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("user_id", "key_type", "response", "expected"),
+    [
+        (
+            100,
+            "ssh",
+            [{"key": "ssh-ed25519 AAA"}, {"key": None}, {"key": ""}, {"key": "ssh-rsa BBB"}],
+            ["ssh-ed25519 AAA", "ssh-rsa BBB"],
+        ),
+        (200, "gpg", [{"key": "gpg-key-content"}], ["gpg-key-content"]),
+        (300, "ssh", RequestException("Network error"), []),
+    ],
+)
+@patch("checkout_last_signed_commit.GitLabUsers._api_request")
+def test_gitlab_users_get_pubkeys(
+    mock_api: MagicMock,
+    user_id: int,
+    key_type: str,
+    response: list[dict[str, str | None]] | Exception,
+    expected: list[str],
+) -> None:
+    if isinstance(response, Exception):
+        mock_api.side_effect = response
+    else:
+        mock_api.return_value.json.return_value = response
+    assert checkout_last_signed_commit.GitLabUsers().get_pubkeys(user_id, key_type=key_type) == expected
+    suffix = f"{user_id}/gpg_keys" if key_type == "gpg" else f"{user_id}/keys"
+    mock_api.assert_called_with(suffix)
+
+
+@pytest.mark.parametrize(
+    ("api_resp", "side_effect", "expected"),
+    [
+        ([{"id": 10}, {"id": 20}, {"id": None}, {}], None, {10, 20}),
+        (None, RequestException("Timeout"), set()),
+    ],
+)
+@patch("checkout_last_signed_commit.GitLabUsers._api_request")
+def test_gitlab_users_search_user_ids(
+    mock_api: MagicMock,
+    api_resp: list[dict[str, int | None]] | None,
+    side_effect: Exception | None,
+    expected: set[int],
+) -> None:
+    if side_effect:
+        mock_api.side_effect = side_effect
+    else:
+        mock_api.return_value.json.return_value = api_resp
+    assert checkout_last_signed_commit.GitLabUsers()._search_user_ids("term") == expected  # ruff: ignore[private-member-access]
+
+
+@pytest.mark.parametrize(
+    ("email", "side_effects", "expected_ids", "expected_calls"),
+    [
+        ("alice@suse.com", [{1}], {1}, ["alice@suse.com"]),
+        ("john.doe@suse.com", [set(), {2}], {2}, ["john.doe@suse.com", "john"]),
+        ("jdoe@suse.de", [set(), set(), {3}], {3}, ["jdoe@suse.de", "jdoe", "doe"]),
+        ("nobody@suse.com", [set(), set(), set()], set(), ["nobody@suse.com", "nobody", "obody"]),
+    ],
+)
+@patch("checkout_last_signed_commit.GitLabUsers._search_user_ids")
+def test_gitlab_users_get_user_ids(
+    mock_search: MagicMock,
+    email: str,
+    side_effects: list[set[int]],
+    expected_ids: set[int],
+    expected_calls: list[str],
+) -> None:
+    mock_search.side_effect = side_effects
+    assert checkout_last_signed_commit.GitLabUsers().get_user_ids(email) == expected_ids
+    assert mock_search.call_args_list == [call(c) for c in expected_calls]
+
+
+@pytest.mark.parametrize("url", ["https://example.com/repo.git", None])
+@patch("checkout_last_signed_commit.git.Repo")
+def test_git_repo_init_new_repo(
+    mock_git_repo_cls: MagicMock,
+    tmp_path: Path,
+    url: str | None,
+) -> None:
+    mock_instance = MagicMock()
+    mock_git_repo_cls.init.side_effect = lambda p, **_: (Path(p) / ".git").mkdir(parents=True) or mock_instance
+    target_dir = tmp_path / "test_repo"
+    if url is None:
+        with pytest.raises(SystemExit) as exc:
+            checkout_last_signed_commit.GitRepo(checkout_dir=str(target_dir), repo_url=url)
+        assert exc.value.code == 1
+    else:
+        repo = checkout_last_signed_commit.GitRepo(checkout_dir=str(target_dir), repo_url=url, branch="feature")
+        assert repo.repo_url == url
+        assert repo.ref == "origin/feature"
+        mock_git_repo_cls.init.assert_called_once_with(target_dir, initial_branch="main")
+        mock_instance.create_remote.assert_called_once_with("origin", url=url, tags=False)
+        mock_instance.config_writer.return_value.set_value.assert_called_once_with(
+            'gpg "ssh"', "allowedSignersFile", str(target_dir / ".git" / "allowed_signers_file")
         )
 
-        self.monkey_patch.setenv(name="PRIVATE_TOKEN", value="my_temporary_value")
-        gpg_key_fetcher = checkout_last_signed_commit.GitLabGPGKeyFetcher()
-        assert gpg_key_fetcher.user_api_url == checkout_last_signed_commit.GITLAB_USER_API_DEFAULT
-        assert gpg_key_fetcher.user_email is None
-        assert gpg_key_fetcher.get_gpg_key_by_uid() is None
-        assert gpg_key_fetcher.fetch_user_uid() == []
 
-    def test_checkout_verified_commit_uninitialized(self) -> None:
-        commit_checker = checkout_last_signed_commit.GitRepoVerifier()
-        assert commit_checker.path_to_checkout_dir is None
-        assert commit_checker.repository_url is None
-        assert commit_checker.commit_sha is None
-        assert commit_checker.uid is None
-        assert commit_checker.repo_instance is None
-        assert commit_checker.create_checkout_dir() == commit_checker.path_to_checkout_dir
+@pytest.mark.parametrize("given_url", ["https://example.com/repo.git", None, "https://different.com/repo.git"])
+@patch("checkout_last_signed_commit.git.Repo")
+def test_git_repo_init_existing_repo(mock_git_repo_cls: MagicMock, repo_dir: Path, given_url: str | None) -> None:
+    mock_git_repo_cls.return_value.remote.return_value.url = "https://example.com/repo.git"
+    if given_url == "https://different.com/repo.git":
+        with pytest.raises(SystemExit) as exc:
+            checkout_last_signed_commit.GitRepo(checkout_dir=str(repo_dir), repo_url=given_url, branch="main")
+        assert exc.value.code == 1
+    else:
+        repo = checkout_last_signed_commit.GitRepo(checkout_dir=str(repo_dir), repo_url=given_url, branch="main")
+        assert repo.repo == mock_git_repo_cls.return_value
 
-        with pytest.raises(SystemExit) as exc_info:
-            commit_checker.init_or_load_repo()
-        assert exc_info.type is SystemExit
-        assert (
-            exc_info.value.code
-            == f"No previous git checkout at {commit_checker.path_to_checkout_dir} and no URL provided"
-        )
-        assert commit_checker.get_default_remote_branch() is None
-        assert commit_checker.get_commiter_email() == []
-        assert commit_checker.get_signed_commit_sha() is None
 
-    @patch("requests.get")
-    def test_git_lab_gpg_key_fetcher_initialized(self, mock_get: MagicMock) -> None:
-        self.monkey_patch.setenv("PRIVATE_TOKEN", "my_temporary_value")
+def test_git_repo_clear_allowed_signers_file(repo_dir: Path) -> None:
+    signers = repo_dir / ".git" / "allowed_signers_file"
+    signers.write_text("existing signer\n", encoding="utf-8")
+    with patch("checkout_last_signed_commit.git.Repo"):
+        repo = checkout_last_signed_commit.GitRepo(checkout_dir=str(repo_dir), branch="main")
+    assert signers.read_text(encoding="utf-8") == "existing signer\n"
+    repo.clear_allowed_signers_file()
+    assert signers.read_text(encoding="utf-8") == ""
 
-        """Test fetch_user_uid by **Name** (failure), call fetch_user_uid() with none as an argument"""
-        mock_data = []
-        mock_response = Mock()
-        mock_response.status_code = 500
-        mock_response.json.return_value = mock_data
-        mock_get.return_value = mock_response
 
-        gpg_key_fetcher = checkout_last_signed_commit.GitLabGPGKeyFetcher(
-            user_email="fake.user@email.com", user_api_url="http://api.example.com/users/"
-        )
+@pytest.mark.parametrize(
+    ("remote_out", "expected"),
+    [
+        ("  HEAD branch: production\n  Remote branch: origin/main", "production"),
+        ("No HEAD branch info", None),
+    ],
+)
+@patch("checkout_last_signed_commit.git.Repo")
+def test_git_repo_get_remote_default_branch(
+    mock_git_repo_cls: MagicMock, repo_dir: Path, remote_out: str, expected: str | None
+) -> None:
+    mock_git_repo_cls.return_value.git.remote.return_value = remote_out
+    if expected is None:
+        repo = checkout_last_signed_commit.GitRepo(checkout_dir=str(repo_dir), branch="main")
+        with pytest.raises(SystemExit) as exc:
+            repo._get_remote_default_branch()  # ruff: ignore[private-member-access]
+        assert exc.value.code == 1
+    else:
+        repo = checkout_last_signed_commit.GitRepo(checkout_dir=str(repo_dir), branch=None)
+        assert repo.ref == f"origin/{expected}"
+        assert repo._get_remote_default_branch() == expected  # ruff: ignore[private-member-access]
 
-        uid = gpg_key_fetcher.fetch_user_uid(email=None)
-        mock_get.assert_called_with(
-            url="http://api.example.com/users/?search=fake", headers={"PRIVATE-TOKEN": "my_temporary_value"}, timeout=10
-        )
-        assert uid == []
 
-        """
-        Test fetch_user_uid by **Email** (success), instantiate GitLabGPGKeyFetcher
-        with mock userid and user API URL
-        """
-        mock_data = [{"id": 100, "username": "mockuser"}, {"id": 200, "username": "usermock"}]
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = mock_data
-        mock_get.return_value = mock_response
+@pytest.mark.parametrize(
+    ("output_line", "cpu_count", "depth"),
+    [
+        ("remote: Counting objects: 10, done.\n", 4, 5),
+        (
+            "remote: Total 0 (delta 0), reused 0 (delta 0)\n",
+            None,
+            checkout_last_signed_commit.GIT_FETCH_DEPTH_LIMIT + 10,
+        ),
+    ],
+)
+def test_git_repo_fetch(
+    repo_and_mock: tuple[checkout_last_signed_commit.GitRepo, MagicMock],
+    monkeypatch: pytest.MonkeyPatch,
+    output_line: str,
+    cpu_count: int | None,
+    depth: int,
+) -> None:
+    repo, mock_repo = repo_and_mock
+    mock_repo.git.fetch.return_value = ("0", "", output_line)
+    monkeypatch.setattr("os.cpu_count", lambda: cpu_count)
+    has_new = "Total 0" not in output_line
+    assert repo.fetch(depth=depth) is has_new
+    mock_repo.git.fetch.assert_called_with(
+        "origin",
+        "--no-tags",
+        "--no-show-forced-updates",
+        with_extended_output=True,
+        progress=True,
+        jobs=max(1, (cpu_count or 1) - 1),
+        depth=min(checkout_last_signed_commit.GIT_FETCH_DEPTH_LIMIT, depth),
+    )
 
-        uid = gpg_key_fetcher.fetch_user_uid(email="mock.user@fake.com")
-        mock_get.assert_called_with(
-            url="http://api.example.com/users/?search=mock.user@fake.com",
-            headers={"PRIVATE-TOKEN": "my_temporary_value"},
-            timeout=10,
-        )
-        assert uid == [100, 200]
 
-        """Test _search_user_ids by **username**"""
-        mock_data = [{"id": 300, "username": "mockuser"}, {"id": 400, "username": "usermock"}]
-        mock_response.json.return_value = mock_data
-        uid = gpg_key_fetcher._search_user_ids("mock.user")  # ruff: ignore[private-member-access]
-        mock_get.assert_called_with(
-            url="http://api.example.com/users/?search=mock.user",
-            headers={"PRIVATE-TOKEN": "my_temporary_value"},
-            timeout=10,
-        )
-        assert uid == [300, 400]
+def test_git_repo_get_committer_email_addrs(
+    repo_and_mock: tuple[checkout_last_signed_commit.GitRepo, MagicMock],
+) -> None:
+    repo, mock_repo = repo_and_mock
+    commits = [
+        MagicMock(committer=MagicMock(email=e)) for e in ["alice@suse.com", "bob@suse.com", "alice@suse.com", "", None]
+    ]
+    mock_repo.iter_commits.return_value = commits
+    assert repo.get_committer_email_addrs() == {"alice@suse.com", "bob@suse.com"}
+    mock_repo.iter_commits.assert_called_once_with("origin/main", committer="suse")
 
-        """Test _search_user_ids by **Name**"""
-        mock_data = [{"id": 500, "username": "Fake User"}, {"id": 600, "username": "johndoe"}]
-        mock_response.json.return_value = mock_data
-        uid = gpg_key_fetcher._fetch_user_uid_by_name("Fake User")  # ruff: ignore[private-member-access]
-        mock_get.assert_called_with(
-            url="http://api.example.com/users/?search=Fake User",
-            headers={"PRIVATE-TOKEN": "my_temporary_value"},
-            timeout=10,
-        )
-        assert uid == [500, 600]
 
-        """Test _search_user_ids by firstname.lastname extracted from email part"""
-        mock_data = [{"id": 700, "username": "Fake User"}, {"id": 800, "username": "johndoe"}]
-        mock_response.json.return_value = mock_data
-        uid = gpg_key_fetcher._fetch_user_uid_by_name(name=None)  # ruff: ignore[private-member-access]
-        mock_get.assert_called_with(
-            url="http://api.example.com/users/?search=fake.user",
-            headers={"PRIVATE-TOKEN": "my_temporary_value"},
-            timeout=10,
-        )
-        assert uid == [700, 800]
+@pytest.mark.parametrize(
+    ("log_output", "key_types", "expected_sha"),
+    [
+        ('"sha_ssh G SHA256:fingerprint123"\n"sha_other G 4AEE18F8"', {"ssh"}, "sha_ssh"),
+        ('"sha_bad B SHA256:bad"\n"sha_good G SHA256:good"', {"ssh"}, "sha_good"),
+        ('"sha_gpg_g G 4AEE18F8"', {"gpg"}, "sha_gpg_g"),
+        ('"sha_gpg_u U 4AEE18F8"', {"gpg"}, "sha_gpg_u"),
+        ('"sha1 B 4AEE18F8"\n"sha2 N none"', {"gpg"}, None),
+        ('"sha_gpg G 4AEE18F8"', {"ssh"}, None),
+    ],
+)
+def test_git_repo_checkout_latest_signed_commit(
+    repo_and_mock: tuple[checkout_last_signed_commit.GitRepo, MagicMock],
+    log_output: str,
+    key_types: set[str],
+    expected_sha: str | None,
+) -> None:
+    repo, mock_repo = repo_and_mock
+    mock_repo.git.log.return_value = log_output
+    assert repo.checkout_latest_signed_commit(key_types=key_types) == expected_sha
+    if expected_sha:
+        mock_repo.git.checkout.assert_called_once_with(expected_sha)
+    else:
+        mock_repo.git.checkout.assert_not_called()
 
-        """Test _search_user_ids for empty response with error status as HTTP response"""
-        mock_response.status_code = 500
-        mock_response.raise_for_status = Mock()
-        mock_response.raise_for_status.side_effect = HTTPError("gitlab is down")
-        uid = gpg_key_fetcher._fetch_user_uid_by_name("Fake User")  # ruff: ignore[private-member-access]
-        mock_get.assert_called_with(
-            url="http://api.example.com/users/?search=Fake User",
-            headers={"PRIVATE-TOKEN": "my_temporary_value"},
-            timeout=10,
-        )
-        assert uid == []
 
-        """Test _search_user_ids for empty return value"""
-        gpg_key_fetcher.user_email = None
-        uid = gpg_key_fetcher._fetch_user_uid_by_name(name=None)  # ruff: ignore[private-member-access]
-        assert uid == []
+def test_git_repo_import_ssh_keys(
+    repo_and_mock: tuple[checkout_last_signed_commit.GitRepo, MagicMock],
+) -> None:
+    repo, _ = repo_and_mock
+    signers_file = repo.allowed_signers_file
+    signers_file.write_text('existing@suse.com namespaces="git" ssh-ed25519 KEY0\n', encoding="utf-8")
 
-        """Test get_gpg_key_by_uid return value for mocked GPG Key"""
-        mock_gpg_key = "THE-FAKE-AND-MOCKED-GPG-KEY"
-        mock_data = [{"key": mock_gpg_key}]
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = mock_data
-        mock_get.return_value = mock_response
+    with patch("checkout_last_signed_commit.logger.info") as mock_info:
+        repo.import_ssh_keys("user@suse.com", ["ssh-dss DEPRECATED_KEY", "ssh-ed25519 KEY1"])
+    mock_info.assert_called_with("Ignoring deprecated ssh-dss key for %s", "user@suse.com")
 
-        gpg_key = gpg_key_fetcher.get_gpg_key_by_uid(uid=500)
-        mock_get.assert_called_with(
-            url="http://api.example.com/users/500/gpg_keys", headers={"PRIVATE-TOKEN": "my_temporary_value"}
-        )
-        assert gpg_key == mock_gpg_key
+    content = signers_file.read_text(encoding="utf-8")
+    assert 'existing@suse.com namespaces="git" ssh-ed25519 KEY0\n' in content
+    assert 'user@suse.com namespaces="git" ssh-ed25519 KEY1\n' in content
 
-        """Test get_gpg_key_by_uid for empty response list with 200 status code"""
-        mock_response.status_code = 200
-        mock_response.json.return_value = []
-        gpg_key = gpg_key_fetcher.get_gpg_key_by_uid(uid=500)
-        assert gpg_key is None
+    # Re-importing existing key does not duplicate
+    repo.import_ssh_keys("user@suse.com", ["ssh-ed25519 KEY1"])
+    assert signers_file.read_text(encoding="utf-8") == content
 
-        """Test get_gpg_key_by_uid for empty response with error status as HTTP response"""
-        mock_response.status_code = 404
-        mock_response.raise_for_status = Mock()
-        mock_response.raise_for_status.side_effect = HTTPError("GPG Key Not Found!")
-        gpg_key = gpg_key_fetcher.get_gpg_key_by_uid(uid=500)
-        mock_get.assert_called_with(
-            url="http://api.example.com/users/500/gpg_keys", headers={"PRIVATE-TOKEN": "my_temporary_value"}
-        )
-        assert gpg_key is None
 
-        """Test get_gpg_key_by_uid for empty response with Request Exception"""
-        mock_response.status_code = 404
-        mock_response.raise_for_status = Mock()
-        mock_response.raise_for_status.side_effect = RequestException("Mocked Request Exception")
-        gpg_key = gpg_key_fetcher.get_gpg_key_by_uid(uid=500)
-        mock_get.assert_called_with(
-            url="http://api.example.com/users/500/gpg_keys", headers={"PRIVATE-TOKEN": "my_temporary_value"}
-        )
-        assert gpg_key is None
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["-t", "d"], ("d", None, None, ["ssh"], False, False, False, False)),
+        (
+            ["-t", "d", "-u", "https://x/r.git", "-b", "f", "-k", "ssh", "gpg", "-c", "-p", "-n", "-v"],
+            ("d", "https://x/r.git", "f", ["ssh", "gpg"], True, True, True, True),
+        ),
+    ],
+)
+def test_parse_args(argv: list[str], expected: tuple[object, ...]) -> None:
+    attrs = (
+        "target_dir",
+        "url",
+        "branch",
+        "key_types",
+        "clean_gpg_keystore",
+        "persist_ssh_keystore",
+        "no_key_sync",
+        "verbose",
+    )
+    args = checkout_last_signed_commit.parse_args(argv)
+    assert tuple(getattr(args, a) for a in attrs) == expected
 
-    @patch("checkout_last_signed_commit.Path")
-    def test_create_checkout_dir(self, mock_path: MagicMock) -> None:
-        commit_checker = checkout_last_signed_commit.GitRepoVerifier(target_dir="fake_dir")
 
-        # Success case
-        assert commit_checker.create_checkout_dir() == "fake_dir"
-        mock_path.return_value.mkdir.assert_called_once_with(mode=0o766, parents=True, exist_ok=True)
+def test_parse_args_invalid() -> None:
+    with pytest.raises(SystemExit):
+        checkout_last_signed_commit.parse_args(["-t", "target_dir", "-k", "invalid_type"])
 
-        # Exception case
-        mock_path.return_value.mkdir.side_effect = Exception("mkdir error")
-        res_err = commit_checker.create_checkout_dir()
-        assert isinstance(res_err, Exception)
-        assert str(res_err) == "mkdir error"
 
-    @patch("checkout_last_signed_commit.git.Repo")
-    @patch("checkout_last_signed_commit.Path")
-    def test_init_or_load_repo(self, mock_path: MagicMock, mock_repo_class: MagicMock) -> None:
-        # Case 1: .git does not exist, URL is provided -> Repo.init
-        mock_git_path = MagicMock()
-        mock_git_path.exists.return_value = False
-        mock_git_path.is_dir.return_value = False
-        mock_path.return_value = mock_git_path
+def test_main_verbose_and_token_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("PRIVATE_TOKEN", raising=False)
+    with (
+        patch("checkout_last_signed_commit.GitRepo"),
+        patch("checkout_last_signed_commit.logger.setLevel") as mock_set_level,
+        pytest.raises(SystemExit) as exc,
+    ):
+        checkout_last_signed_commit.Main(["-t", "dir", "-v"]).run()
+    assert exc.value.code == 1
+    mock_set_level.assert_called_with(checkout_last_signed_commit.logging.DEBUG)
 
-        mock_repo = MagicMock()
-        mock_repo_class.init.return_value = mock_repo
 
-        commit_checker = checkout_last_signed_commit.GitRepoVerifier(
-            target_dir="fake_dir", repo_url="https://github.com/example/repo.git"
-        )
-        commit_checker.init_or_load_repo()
+@pytest.mark.parametrize(
+    "argv",
+    [["-t", "dir", "-k", "gpg", "-c"], ["-t", "dir"]],
+)
+def test_main_no_new_commits_valid_head(
+    mock_main_deps: tuple[MagicMock, MagicMock, MagicMock],
+    argv: list[str],
+) -> None:
+    mock_repo, _, mock_gpg = mock_main_deps
+    mock_repo.fetch.return_value = False
+    mock_repo.repo.head.is_valid.return_value = True
 
-        mock_repo_class.init.assert_called_once_with("fake_dir", initial_branch="main")
-        mock_repo.create_remote.assert_called_once_with("origin", url="https://github.com/example/repo.git", tags=False)
-        mock_repo.config_writer.return_value.set_value.assert_called_once_with(
-            'gpg "ssh"', "allowedSignersFile", "/dev/null"
-        )
-        mock_repo.config_writer.return_value.set_value.return_value.release.assert_called_once()
+    checkout_last_signed_commit.Main(argv).run()
 
-        # Case 2: .git exists -> git.Repo(path)
-        mock_repo_class.init.reset_mock()
-        mock_path.side_effect = None
+    mock_repo.fetch.assert_called_once_with(checkout_last_signed_commit.INITIAL_GIT_FETCH_DEPTH)
+    assert mock_gpg.clear_public_keys.called == ("-c" in argv)
 
-        mock_git_path = MagicMock()
-        mock_git_path.exists.return_value = True
-        mock_git_path.is_dir.return_value = True
-        mock_path.return_value = mock_git_path
 
-        commit_checker2 = checkout_last_signed_commit.GitRepoVerifier(
-            target_dir="fake_dir", repo_url="https://github.com/example/repo.git"
-        )
-        commit_checker2.init_or_load_repo()
-        mock_repo_class.assert_called_with("fake_dir/.git")
+@pytest.mark.parametrize(
+    ("argv", "fetch_side_effect", "config"),
+    [
+        (["-t", "dir", "-k", "gpg", "-c", "-n"], [], {}),
+        (["-t", "dir"], [False, False], {"head_valid": False}),
+        (["-t", "dir"], [True, False], {}),
+        (["-t", "dir", "-k", "gpg"], [True, False], {"emails": {"bob@suse.com"}, "users": {202}, "pubkeys": ["bad"]}),
+        (["-t", "dir", "-k", "gpg", "ssh"], [True, False], {"emails": {"dan@suse.com"}, "users": {404}}),
+    ],
+)
+def test_main_fetch_or_import_failures(
+    mock_main_deps: tuple[MagicMock, MagicMock, MagicMock],
+    argv: list[str],
+    fetch_side_effect: list[bool],
+    config: dict[str, object],
+) -> None:
+    mock_repo, mock_users, mock_gpg = mock_main_deps
+    mock_repo.fetch.side_effect = fetch_side_effect
+    mock_repo.repo.head.is_valid.return_value = config.get("head_valid", True)
+    mock_repo.get_committer_email_addrs.return_value = config.get("emails", set())
+    mock_users.get_user_ids.return_value = config.get("users", set())
+    mock_users.get_pubkeys.return_value = config.get("pubkeys", [])
+    mock_gpg.import_keys.return_value.count = config.get("gpg_count", 0)
 
-    def test_fetch_git_repo(self) -> None:
-        commit_checker = checkout_last_signed_commit.GitRepoVerifier(target_dir="fake_dir")
+    with pytest.raises(SystemExit) as exc:
+        checkout_last_signed_commit.Main(argv).run()
+    assert exc.value.code == 1
+    mock_repo.checkout_latest_signed_commit.assert_not_called()
 
-        # repo_instance is None
-        assert commit_checker.fetch_git_repo() == ""
 
-        # repo_instance is not None
-        mock_repo = MagicMock()
-        mock_repo.git.fetch.return_value = ("status", "stdout", "stderr_output")
-        commit_checker.repo_instance = mock_repo
+@pytest.mark.parametrize(
+    ("argv", "exp_checkout_keys"),
+    [
+        (["-t", "dir", "-k", "gpg", "ssh"], ["gpg", "ssh"]),
+        (["-t", "dir"], ["ssh"]),
+        (["-t", "dir", "-n"], ["ssh"]),
+    ],
+)
+def test_main_sync_and_checkout(
+    mock_main_deps: tuple[MagicMock, MagicMock, MagicMock],
+    argv: list[str],
+    exp_checkout_keys: list[str],
+) -> None:
+    mock_repo, mock_users, mock_gpg = mock_main_deps
+    mock_repo.fetch.return_value = True
+    mock_repo.get_committer_email_addrs.return_value = {"user@suse.com"}
+    mock_repo.checkout_latest_signed_commit.return_value = "commit_sha"
+    mock_users.get_user_ids.return_value = {101}
+    mock_users.get_pubkeys.return_value = ["mock_key"]
+    mock_gpg.import_keys.return_value.count = 1
 
-        res = commit_checker.fetch_git_repo(depth=5)
-        assert res == "stderr_output"
-        mock_repo.git.fetch.assert_called_once_with(
-            "origin",
-            "--no-tags",
-            "--no-show-forced-updates",
-            with_extended_output=True,
-            progress=True,
-            jobs=ANY,
-            depth=5,
-        )
+    checkout_last_signed_commit.Main(argv).run()
 
-    def test_get_default_remote_branch(self) -> None:
-        commit_checker = checkout_last_signed_commit.GitRepoVerifier(target_dir="fake_dir")
+    if "-n" not in argv:
+        mock_repo.import_ssh_keys.assert_called_once_with("user@suse.com", ["mock_key"])
+    else:
+        mock_repo.get_committer_email_addrs.assert_not_called()
+    mock_repo.checkout_latest_signed_commit.assert_called_once_with(exp_checkout_keys)
 
-        # Case when repo_instance is None
-        assert commit_checker.get_default_remote_branch() is None
 
-        # Parameterized cases when repo_instance is not None
-        test_cases = [
-            ("  HEAD branch: main\n  Some other info", "main"),
-            ("No HEAD branch info", None),
-        ]
-        for remote_output, expected_branch in test_cases:
-            mock_repo = MagicMock()
-            mock_repo.git.remote.return_value = remote_output
-            commit_checker.repo_instance = mock_repo
-            assert commit_checker.get_default_remote_branch() == expected_branch
-            mock_repo.git.remote.assert_called_once_with("show", "origin")
+def test_main_retry_fetch_with_increased_depth(mock_main_deps: tuple[MagicMock, MagicMock, MagicMock]) -> None:
+    mock_repo, _, _ = mock_main_deps
+    mock_repo.fetch.return_value = True
+    mock_repo.checkout_latest_signed_commit.side_effect = [None, "retry_sha"]
+    checkout_last_signed_commit.Main(["-t", "dir", "-n"]).run()
+    assert mock_repo.fetch.call_args_list == [
+        call(checkout_last_signed_commit.INITIAL_GIT_FETCH_DEPTH),
+        call(checkout_last_signed_commit.INITIAL_GIT_FETCH_DEPTH * 2),
+    ]
 
-    @patch.object(checkout_last_signed_commit.GitRepoVerifier, "get_default_remote_branch")
-    def test_get_commiter_email(self, mock_get_def_branch: MagicMock) -> None:
-        commit_checker = checkout_last_signed_commit.GitRepoVerifier(target_dir="fake_dir")
 
-        # Case 1: branch is not None, repo_instance is None
-        assert commit_checker.get_commiter_email(git_branch="dev") == []
+def test_main_depth_limit_reached(
+    mock_main_deps: tuple[MagicMock, MagicMock, MagicMock], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mock_repo, _, _ = mock_main_deps
+    mock_repo.fetch.return_value = True
+    mock_repo.checkout_latest_signed_commit.return_value = None
+    monkeypatch.setattr(checkout_last_signed_commit, "GIT_FETCH_DEPTH_LIMIT", 4)
+    with pytest.raises(SystemExit) as exc:
+        checkout_last_signed_commit.Main(["-t", "dir", "-n"]).run()
+    assert exc.value.code == 1
 
-        # Case 2: branch is None, repo_instance is not None
-        mock_get_def_branch.return_value = "main"
-        mock_repo = MagicMock()
-        mock_commit1 = MagicMock()
-        mock_commit1.committer.email = "user1@suse.com"
-        mock_commit2 = MagicMock()
-        mock_commit2.committer.email = "user2@suse.com"
-        mock_commit3 = MagicMock()
-        mock_commit3.committer.email = "user1@suse.com"
-        mock_repo.iter_commits.return_value = [mock_commit1, mock_commit2, mock_commit3]
-        commit_checker.repo_instance = mock_repo
 
-        emails = commit_checker.get_commiter_email(git_branch=None)
-        assert emails == ["user1@suse.com", "user2@suse.com"]
-        mock_get_def_branch.assert_called_once()
-        mock_repo.iter_commits.assert_called_once_with("origin/main", committer="suse")
+def test_main_execution(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    mock_repo = MagicMock()
+    mock_repo.head.is_valid.return_value = True
+    mock_repo.git.fetch.return_value = ("0", "", "remote: Total 0 (delta 0), reused 0 (delta 0)")
+    monkeypatch.setattr("git.Repo", MagicMock(return_value=mock_repo))
 
-    def test_get_signed_commit_sha(self) -> None:
-        commit_checker = checkout_last_signed_commit.GitRepoVerifier(target_dir="fake_dir")
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(sys, "argv", ["checkout_last_signed_commit.py", "-t", str(tmp_path), "-b", "main", "-n"])
 
-        # Case when repo_instance is None
-        assert commit_checker.get_signed_commit_sha("main") is None
-
-        # Parameterized cases when repo_instance is not None
-        test_cases = [
-            ("main", "G abcdef1234567890\nN baddecaf", "abcdef1234567890"),
-            ("dev", "B somehash\nU fedcba0987654321", "fedcba0987654321"),
-            ("dev", "B somehash\nN otherhash", None),
-        ]
-        for branch, git_log, expected_sha in test_cases:
-            mock_repo = MagicMock()
-            mock_repo.git.log.return_value = git_log
-            commit_checker.repo_instance = mock_repo
-            assert commit_checker.get_signed_commit_sha(branch) == expected_sha
-            mock_repo.git.log.assert_called_once_with(f"origin/{branch}", '--pretty="%G? %H"')
-
-    def test_parse_args(self) -> None:
-        args = checkout_last_signed_commit.parse_args(["-t", "fake_dir", "-u", "https://example.com/repo.git"])
-        assert args.target_dir == "fake_dir"
-        assert args.url == "https://example.com/repo.git"
-
-    @patch("checkout_last_signed_commit.GitRepoVerifier")
-    @patch("checkout_last_signed_commit.GitLabGPGKeyFetcher")
-    @patch("checkout_last_signed_commit.gnupg.GPG")
-    def test_main_scenarios(
-        self,
-        mock_gpg_class: MagicMock,
-        mock_fetcher_class: MagicMock,
-        mock_checker_class: MagicMock,
-    ) -> None:
-        self.monkey_patch.setenv("PRIVATE_TOKEN", "fake_token")
-
-        scenarios: list[dict[str, Any]] = [
-            # Case 1: No new commits found
-            {
-                "fetch_repo_ret": "remote: Total 0 ",
-                "committer_emails": [],
-                "uids": [],
-                "gpg_key_side": None,
-                "import_code": 0,
-                "signed_commit": None,
-                "expected_exit": "No new commits found on server",
-                "expected_checkout": None,
-            },
-            # Case 2: Success with duplicate emails
-            {
-                "fetch_repo_ret": "new commits",
-                "committer_emails": ["skipped@suse.com", "skipped@suse.com", "dev@suse.com"],
-                "uids": [[123], [456]],
-                "gpg_key_side": "gpg-key-content",
-                "import_code": 0,
-                "signed_commit": [None, "abcdef123456"],
-                "expected_exit": None,
-                "expected_checkout": "abcdef123456",
-            },
-            # Case 3: Import failure and retry with second key/uid
-            {
-                "fetch_repo_ret": "new commits",
-                "committer_emails": ["developer@suse.com"],
-                "uids": [123, 456],
-                "gpg_key_side": [None, "good-gpg-key"],
-                "import_code": 0,
-                "signed_commit": "abcdef123456",
-                "expected_exit": None,
-                "expected_checkout": "abcdef123456",
-            },
-            # Case 4: Success with empty emails on first try, exits on second try
-            {
-                "fetch_repo_ret": "new commits",
-                "committer_emails": [[], ["dev@suse.com"]],
-                "uids": [789],
-                "gpg_key_side": "gpg-key-content-3",
-                "import_code": 0,
-                "signed_commit": "abcdef987654",
-                "expected_exit": None,
-                "expected_checkout": "abcdef987654",
-            },
-            # Case 5: Hit loop break, gpg_keys_not_found cache, and import failures
-            {
-                "fetch_repo_ret": ["", "", "remote: Total 0 "],
-                "committer_emails": [["missing@suse.com"], ["missing@suse.com", "badkey@suse.com"]],
-                "uids": [[101], [202]],
-                "gpg_key_side": [None, "bad-gpg-key"],
-                "import_code": 1,
-                "signed_commit": None,
-                "expected_exit": None,
-                "expected_checkout": None,
-            },
-        ]
-
-        for s in scenarios:
-            mock_gpg_class.reset_mock()
-            mock_fetcher_class.reset_mock()
-            mock_checker_class.reset_mock()
-
-            mock_checker = MagicMock()
-            if isinstance(s["fetch_repo_ret"], list):
-                mock_checker.fetch_git_repo.side_effect = s["fetch_repo_ret"]
-            else:
-                mock_checker.fetch_git_repo.return_value = s["fetch_repo_ret"]
-
-            if s["committer_emails"] and isinstance(s["committer_emails"][0], list):
-                mock_checker.get_commiter_email.side_effect = s["committer_emails"]
-            else:
-                mock_checker.get_commiter_email.return_value = s["committer_emails"]
-
-            if isinstance(s["signed_commit"], list):
-                mock_checker.get_signed_commit_sha.side_effect = s["signed_commit"]
-            else:
-                mock_checker.get_signed_commit_sha.return_value = s["signed_commit"]
-
-            mock_checker_class.return_value = mock_checker
-            mock_checker.init_or_load_repo.return_value = mock_checker.repo_instance
-
-            mock_fetcher = MagicMock()
-            if s["uids"] and isinstance(s["uids"][0], list):
-                mock_fetcher.fetch_user_uid.side_effect = s["uids"]
-            else:
-                mock_fetcher.fetch_user_uid.return_value = s["uids"]
-
-            if isinstance(s["gpg_key_side"], list):
-                mock_fetcher.get_gpg_key_by_uid.side_effect = s["gpg_key_side"]
-            else:
-                mock_fetcher.get_gpg_key_by_uid.return_value = s["gpg_key_side"]
-            mock_fetcher_class.return_value = mock_fetcher
-
-            mock_gpg = MagicMock()
-            mock_import_result = MagicMock()
-            mock_import_result.returncode = s["import_code"]
-            mock_import_result.stderr = "gpg: no valid OpenPGP data found" if s["import_code"] != 0 else ""
-            mock_gpg.import_keys.return_value = mock_import_result
-            mock_gpg_class.return_value = mock_gpg
-
-            if s["expected_exit"]:
-                with pytest.raises(SystemExit) as exc_info:
-                    checkout_last_signed_commit.main(["-t", "fake_dir", "-u", "https://example.com/repo.git"])
-                assert exc_info.value.code == s["expected_exit"]
-            else:
-                checkout_last_signed_commit.main(["-t", "fake_dir", "-u", "https://example.com/repo.git"])
-                if s["expected_checkout"]:
-                    mock_checker.repo_instance.git.checkout.assert_called_once_with(s["expected_checkout"])
-                else:
-                    mock_checker.repo_instance.git.checkout.assert_not_called()
-
-    def test_main_execution(self) -> None:
-        import sys
-
-        orig_argv = sys.argv
-        sys.argv = ["checkout_last_signed_commit.py"]
-
-        script_content = pathlib.Path("checkout_last_signed_commit.py").read_text(encoding="utf-8")
-        code = compile(script_content, "checkout_last_signed_commit.py", "exec")
-
-        with pytest.raises(SystemExit):
-            exec(code, {"__name__": "__main__"})  # ruff: ignore[exec-builtin]
-
-        sys.argv = orig_argv
+    runpy.run_path("checkout_last_signed_commit.py", run_name="__main__")

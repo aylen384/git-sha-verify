@@ -21,218 +21,214 @@ import os
 import re
 import sys
 from pathlib import Path
+from typing import NoReturn
 
 import git
 import gnupg
 import requests
 
-logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 GITLAB_USER_API_DEFAULT = "https://gitlab.suse.de/api/v4/users/"
 INITIAL_GIT_FETCH_DEPTH = 2
 
 # Depth 2147483647 (0x7fffffff, max signed 32-bit int) means infinite depth: https://git-scm.com/docs/shallow
-GIT_FETCH_DEPTH_LIMIT = 2147483647
+GIT_FETCH_DEPTH_LIMIT = 0x7FFFFFFF
 FETCH_NO_NEW_COMMITS_REGEX = "remote:.*Total 0 .*"
 
 
-class GitLabGPGKeyFetcher:
-    """GPG Key fetcher class functionalities to fetch GPG key by unique user identifier.
+def fatal_error(msg: str) -> NoReturn:
+    logger.error(msg)
+    sys.exit(1)
 
-    Supports fetching user id by user email and username.
+
+class GPG(gnupg.GPG):
+    def clear_public_keys(self) -> None:
+        private_fingerprints = {key["fingerprint"] for key in self.list_keys(secret=True)}
+
+        for key in self.list_keys():
+            fingerprint = key["fingerprint"]
+            if fingerprint not in private_fingerprints:
+                self.delete_keys(fingerprint)
+
+
+class GitLabUsers:
+    """Fetch user_ids and a user's GPG/SSH public keys from GitLab.
 
     Parameters
     ----------
-        user_email (str): User email ID.
-        user_api_url (str): Service provider (such as GitLab) API endpoint for fetching user information.
-        private_token (str): Service provider (such as GitLab) private token for API authentication.
+        user_api_url:  URL to API endpoint for fetching user information.
+        private_token: Token for API authentication.
+
+    """
+
+    def __init__(self, private_token: str | None = None, user_api_url: str = GITLAB_USER_API_DEFAULT) -> None:
+        self.private_token = private_token
+        self.user_api_url = user_api_url
+
+    def get_pubkeys(self, user_id: int, key_type: str = "ssh") -> list[str]:
+        """Fetch the public keys for a given GitLab user ID."""
+        try:
+            res = self._api_request(f"{user_id}/{'gpg_' if key_type == 'gpg' else ''}keys")
+            return [entry.get("key") for entry in res.json() if entry.get("key")]
+        except requests.exceptions.RequestException:
+            logger.exception("An error occurred")
+            return []
+
+    def get_user_ids(self, email: str) -> set[int]:
+        """Return a set of user IDs matching a given email or at least parts of the name."""
+        logger.debug("Looking up user ID by email: %s", email)
+        user_ids = self._search_user_ids(email)
+        if not user_ids:
+            # For emails like john.doe@suse.com try to get the first name here
+            first_name = email.split("@", maxsplit=1)[0].split(".", maxsplit=1)[0]
+            user_ids = self._search_user_ids(first_name)
+            logger.debug("user IDs by derived name %s: %s", first_name, user_ids)
+        if not user_ids:
+            # For emails like jdoe@suse.de try to get the last name here
+            last_name = email.split("@", maxsplit=1)[0][1:]
+            user_ids = self._search_user_ids(last_name)
+            logger.debug("user IDs by derived name %s: %s", last_name, user_ids)
+        return user_ids
+
+    def _search_user_ids(self, term: str) -> set[int]:
+        """Search GitLab users by name, username, or public email and return a set of user IDs."""
+        try:
+            res = self._api_request(f"?search={term}")
+            return {entry.get("id") for entry in res.json() if entry.get("id")}
+        except requests.exceptions.RequestException:
+            logger.exception("Failed searching GitLab users for term=%s", term)
+            return set()
+
+    def _api_request(self, url_suffix: str, timeout: int = 10) -> requests.Response:
+        headers = {"PRIVATE-TOKEN": self.private_token} if self.private_token else None
+        res = requests.get(url=f"{self.user_api_url}{url_suffix}", timeout=timeout, headers=headers)
+        res.raise_for_status()
+        return res
+
+
+class GitRepo:
+    """Perform actions on a git repo.
+
+    Parameters
+    ----------
+        checkout_dir: Target directory where to clone or check out the repository.
+        repo_url:     Git Repository URL.
+        branch:       Remote branch to use (defaults to remote default branch)
 
     """
 
     def __init__(
-        self, user_email: str | None = None, user_api_url: str | None = None, private_token: str | None = None
+        self,
+        checkout_dir: str,
+        repo_url: str | None = None,
+        branch: str | None = None,
     ) -> None:
-        self.private_token = private_token or os.environ.get("PRIVATE_TOKEN")
-        if not self.private_token:
-            err_msg = "Please set the environment variable PRIVATE_TOKEN for GitLab User API Authentication"
-            logger.error(err_msg)
-            sys.exit(err_msg)
+        self.checkout_dir = Path(checkout_dir)
+        git_dir = self.checkout_dir / ".git"
+        self.allowed_signers_file = git_dir / "allowed_signers_file"
+        self.repo_url = repo_url
 
-        if user_api_url is None:
-            self.user_api_url = GITLAB_USER_API_DEFAULT
-        else:
-            self.user_api_url = user_api_url
-        self.user_email = user_email
-
-    def get_gpg_key_by_uid(self, uid: int | None = None) -> str | None:
-        """Fetch the GPG public key for a given GitLab user ID."""
-        gpg_key = None
-        if uid is not None:
-            try:
-                response = requests.get(  # ruff: ignore[request-without-timeout]
-                    url=self.user_api_url + str(uid) + "/gpg_keys", headers={"PRIVATE-TOKEN": self.private_token}
-                )
-                response.raise_for_status()
-                if response.status_code == 200 and len(response.json()) != 0:
-                    gpg_key = response.json()[0].get("key")
-            except requests.exceptions.HTTPError:
-                logger.exception("HTTP Error")
-            except requests.exceptions.RequestException:
-                logger.exception("An error occurred")
-        return gpg_key
-
-    def fetch_user_uid(self, email: str | None = None) -> list[int]:
-        """Return a list of user IDs matching a given email (or self.user_email)."""
-        email = email or self.user_email
-        if not email:
-            return []
-
-        logger.debug("Looking up UID by email: %s", email)
-        singular_ids = self._search_user_ids(term=email)
-        if not singular_ids:
-            base_name = email.split("@")[0].split(".")[0]
-            singular_ids = self._fetch_user_uid_by_name(base_name)
-            logger.debug("UIDs by derived name %s: %s", base_name, singular_ids)
-
-        return singular_ids
-
-    def _fetch_user_uid_by_name(self, name: str | None = None) -> list[int]:
-        """Return a list of user IDs matching a given name.
-
-        If name is None and user_email is set, use the local-part of the email.
-        """
-        if name is None and self.user_email:
-            name = self.user_email.split("@")[0]
-        logger.debug("Looking up UID by name: %s", name)
-        if not name:
-            return []
-
-        return self._search_user_ids(term=name)
-
-    # --------- internal helpers --------- #
-    def _search_user_ids(self, term: str) -> list[int]:
-        """Search GitLab users by term and return a list of IDs."""
-        try:
-            response = requests.get(
-                url=f"{self.user_api_url}?search={term}",
-                headers={"PRIVATE-TOKEN": self.private_token},
-                timeout=10,
-            )
-            response.raise_for_status()
-        except requests.exceptions.RequestException:
-            logger.exception("Failed searching GitLab users for term=%s", term)
-            return []
-
-        data = response.json()
-        return [entry.get("id") for entry in data or []]
-
-
-class GitRepoVerifier:
-    """Checking out verified commit class functionalities to check GPG commit signature before checking out the git commit.
-
-    Parameters
-    ----------
-        target_dir (str): Target directory where to clone or checkout the repository.
-        repo_url (str): Git Repository URL.
-
-    """
-
-    def __init__(self, target_dir: str | None = None, repo_url: str | None = None) -> None:
-        self.path_to_checkout_dir = target_dir
-        self.repository_url = repo_url
-        self.commit_sha = None
-        self.uid = None
-        self.repo_instance = None
-
-    def create_checkout_dir(self) -> str | Exception | None:
-        """Create the target directory if it doesn't exist."""
-        dir_path = self.path_to_checkout_dir
-        if self.path_to_checkout_dir is not None:
-            try:
-                Path(str(self.path_to_checkout_dir)).mkdir(mode=0o766, parents=True, exist_ok=True)
-            except Exception as e:
-                dir_path = e
-                logger.exception("An error occurred")
-        return dir_path
-
-    def init_or_load_repo(self) -> git.Repo:
-        """Initialize a new repo or loads an existing one."""
-        path = str(self.path_to_checkout_dir) + "/.git"
-        if not Path(path).exists() or not Path(path).is_dir():
-            if self.repository_url is None:
-                err_msg = f"No previous git checkout at {self.path_to_checkout_dir} and no URL provided"
-                logger.error(err_msg)
-                sys.exit(err_msg)
+        # ensure that checkout dir exists with correct permissions
+        self.checkout_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+        if not (git_dir.exists() and git_dir.is_dir()):
+            if self.repo_url is None:
+                fatal_error(f"No previous git checkout at {self.checkout_dir} and no URL provided")
 
             logger.info("Initializing repo...")
-            repo = git.Repo.init(self.path_to_checkout_dir, initial_branch="main")
-            repo.create_remote("origin", url=self.repository_url, tags=False)
-            repo.config_writer().set_value('gpg "ssh"', "allowedSignersFile", "/dev/null").release()
+            self.repo = git.Repo.init(self.checkout_dir, initial_branch="main")
+            self.repo.create_remote("origin", url=self.repo_url, tags=False)
+            self.repo.config_writer().set_value(
+                'gpg "ssh"', "allowedSignersFile", str(self.allowed_signers_file)
+            ).release()
         else:
-            logger.info("Using existing repo at path: %s", path)
-            repo = git.Repo(path)
-        self.repo_instance = repo
-        return repo
+            logger.info("Using existing repo at path: %s", git_dir)
+            self.repo = git.Repo(git_dir)
+            if repo_url and repo_url != self.repo.remote("origin").url:
+                fatal_error(f"Repo already present with different remote url: {self.repo.remote('origin').url}")
+        self.allowed_signers_file.touch(mode=0o644, exist_ok=True)
 
-    def fetch_git_repo(self, depth: int = INITIAL_GIT_FETCH_DEPTH) -> str:
-        """Fetch a specific depth of the remote repository and return its stderr output, or an empty string if not initialized."""
+        self.ref = f"origin/{branch or self._get_remote_default_branch()}"
+        logger.info("Using ref: %s", self.ref)
+
+    def clear_allowed_signers_file(self) -> None:
+        self.allowed_signers_file.write_text("", encoding="utf-8")
+
+    def fetch(self, depth: int = INITIAL_GIT_FETCH_DEPTH) -> bool:
+        """Fetch commits from remote repo with a specific depth. Return True if something was fetched."""
         cpus = os.cpu_count() or 1
         fetch_jobs = max(1, cpus - 1)
-        if self.repo_instance:
-            fetcher_info = self.repo_instance.git.fetch(
-                "origin",
-                "--no-tags",
-                "--no-show-forced-updates",
-                with_extended_output=True,
-                progress=True,
-                jobs=fetch_jobs,
-                depth=min(GIT_FETCH_DEPTH_LIMIT, depth),
-            )
-            logger.debug("Status: %s", fetcher_info[0])
-            logger.debug("stdout %s", fetcher_info[1])
-            logger.debug("stderr: %s", fetcher_info[2])
-            return fetcher_info[2]
-        return ""
+        fetcher_info = self.repo.git.fetch(
+            "origin",
+            "--no-tags",
+            "--no-show-forced-updates",
+            with_extended_output=True,
+            progress=True,
+            jobs=fetch_jobs,
+            depth=min(GIT_FETCH_DEPTH_LIMIT, depth),
+        )
+        logger.debug("Status: %s", fetcher_info[0])
+        logger.debug("stdout %s", fetcher_info[1])
+        logger.debug("stderr: %s", fetcher_info[2])
+        return not bool(re.search(FETCH_NO_NEW_COMMITS_REGEX, fetcher_info[2]))
 
-    def get_default_remote_branch(self) -> str | None:
+    def get_committer_email_addrs(self) -> set[str]:
+        """Return set of committer email addresses, filtered by 'suse' committer."""
+        return {
+            commit.committer.email
+            for commit in self.repo.iter_commits(self.ref, committer="suse")
+            if commit.committer.email
+        }
+
+    def checkout_latest_signed_commit(self, key_types: set[str] | frozenset = frozenset(("gpg", "ssh"))) -> str | None:
+        """Search the git log for the most recent commit with a Good (G) or Unknown (U) signature.
+
+        If a commit is found, checkout the commit and return the SHA, else return None.
+        """
+        commit_sha = None
+        for commit in self.repo.git.log(self.ref, '--pretty="%H %G? %GK"').replace('"', "").split("\n"):
+            sha, signature_status, signature_key = commit.split(" ")
+            if ":" in signature_key and "ssh" in key_types:
+                if signature_status == "G":
+                    # valid SSH signatures must have status G
+                    commit_sha = sha
+                    break
+            elif signature_status in {"G", "U"} and "gpg" in key_types:
+                # valid GPG signatures can be G or U
+                commit_sha = sha
+                break
+        if commit_sha:
+            self.repo.git.checkout(commit_sha)
+        return commit_sha
+
+    def import_ssh_keys(self, email_addr: str, ssh_keys: list[str]) -> None:
+        allowed_signers = ""
+        with self.allowed_signers_file.open(encoding="utf-8") as allowed_signers_file:
+            allowed_signers = allowed_signers_file.read()
+        with self.allowed_signers_file.open("a", encoding="utf-8") as allowed_signers_file:
+            for ssh_key in ssh_keys:
+                if ssh_key.startswith("ssh-dss"):
+                    logger.info("Ignoring deprecated ssh-dss key for %s", email_addr)
+                line = f'{email_addr} namespaces="git" {ssh_key}\n'
+                if line not in allowed_signers:
+                    allowed_signers_file.write(line)
+
+    def _get_remote_default_branch(self) -> str:
         """Determine the default branch name from the remote 'origin'."""
         default_branch = None
-        if self.repo_instance:
-            head_branch = self.repo_instance.git.remote("show", "origin")
-            matches = re.search(r"\s*HEAD branch:\s*(.*)", head_branch)
-            if matches:
-                default_branch = matches.group(1)
-        logger.debug("Def Branch: %s", default_branch)
-        return default_branch
-
-    def get_commiter_email(self, git_branch: str | None = None) -> list[str]:
-        """Get unique committer emails for a given branch ref, filtered by 'suse' committer."""
-        ref_name = f"origin/{git_branch or self.get_default_remote_branch()}"
-        if self.repo_instance:
-            emails = {
-                commit.committer.email
-                for commit in self.repo_instance.iter_commits(ref_name, committer="suse")
-                if commit.committer.email
-            }
-            return sorted(emails)
-        return []
-
-    def get_signed_commit_sha(self, git_branch: str | None = None) -> str | None:
-        """Search the git log for the most recent commit with a Good (G) or Unknown (U) GPG signature."""
-        commit_sha = None
-        ref_name = f"origin/{git_branch or self.get_default_remote_branch()}"
-        if self.repo_instance:
-            log_op = self.repo_instance.git.log(ref_name, '--pretty="%G? %H"')
-            regex_search = re.search(r"(?<=[UG] )[a-fA-F0-9]*", log_op)
-            if regex_search:
-                commit_sha = regex_search.group(0)
-        return commit_sha
+        head_branch = self.repo.git.remote("show", "origin")
+        matches = re.search(r"\s*HEAD branch:\s*(.*)", head_branch)
+        if matches:
+            default_branch = matches.group(1)
+            logger.debug("Def Branch: %s", default_branch)
+            return default_branch
+        fatal_error("Unable to determine remote default branch")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Checkout latest GPG-signed commit from a git repository",
+        description="Check out the latest signed commit from a git repository",
     )
     parser.add_argument(
         "-t",
@@ -243,96 +239,118 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "-u",
         "--url",
-        required=True,
-        help="Remote URL of git repository ending with .git",
+        help="Remote URL of git repository. Defaults to URL of existing checkout if possible.",
+    )
+    parser.add_argument(
+        "-b",
+        "--branch",
+        help="Check out the specified branch instead of the remote default branch.",
+    )
+    parser.add_argument(
+        "-k",
+        "--key-types",
+        nargs="+",
+        choices=["ssh", "gpg"],
+        default=["ssh"],
+        help="Key type to use. Both can be specified in parallel. Defaults to ssh.",
+    )
+    parser.add_argument(
+        "-c",
+        "--clean-gpg-keystore",
+        action="store_true",
+        help="Start with a clean GPG key store.",
+    )
+    parser.add_argument(
+        "-p",
+        "--persist-ssh-keystore",
+        action="store_true",
+        help="Don't empty SSH allowed_signers file on startup.",
+    )
+    parser.add_argument(
+        "-n",
+        "--no-key-sync",
+        action="store_true",
+        help="Don't sync GPG or SSH keys from GitLab. Implies -p and conflicts with -c. Waves the need to supply GitLab token via PRIVATE_TOKEN env var.",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Verbose logging.",
     )
     return parser.parse_args(argv)
 
 
-def main(argv: list[str] | None = None) -> None:
-    gpg_keys_imported = set()
-    gpg_keys_not_found = set()
-    git_fetch_depth = INITIAL_GIT_FETCH_DEPTH
+class Main:
+    def __init__(self, argv: list[str] | None = None) -> None:
+        self.processed_email_addrs = set()
+        self.processed_user_ids = set()
+        self.args = parse_args(argv)
+        if self.args.verbose:
+            logger.setLevel(logging.DEBUG)
+        self.git_repo = GitRepo(self.args.target_dir, self.args.url, self.args.branch)
+        if "ssh" in self.args.key_types and not (self.args.persist_ssh_keystore or self.args.no_key_sync):
+            self.git_repo.clear_allowed_signers_file()
+        if not self.args.no_key_sync and not os.environ.get("PRIVATE_TOKEN"):
+            fatal_error("GitLab tokan must be set via PRIVATE_TOKEN env var unless running with -n")
+        self.gitlab_users = GitLabUsers(private_token=os.environ.get("PRIVATE_TOKEN"))
+        self.gpg = GPG()
 
-    args = parse_args(argv)
+        if "gpg" in self.args.key_types and self.args.clean_gpg_keystore:
+            if self.args.no_key_sync:
+                fatal_error("Conflicting arguments -c and -n")
+            self.gpg.clear_public_keys()
 
-    git_repo = GitRepoVerifier(args.target_dir, args.url)
-    git_repo.create_checkout_dir()
-    repo = git_repo.init_or_load_repo()
+    def _sync_gpg_keys(self, user_id: int) -> bool:
+        if "gpg" in self.args.key_types and (gpg_keys := self.gitlab_users.get_pubkeys(user_id, key_type="gpg")):
+            if self.gpg.import_keys("\n".join(gpg_keys)).count:
+                return True
+            logger.error("Could not import GPG key for user_id: %i", user_id)
+        return False
 
-    default_remote_branch = git_repo.get_default_remote_branch()
-    logger.info("Default Branch: %s", default_remote_branch)
+    def _sync_ssh_keys(self, user_id: int, email_addr: str) -> bool:
+        if "ssh" in self.args.key_types and (ssh_keys := self.gitlab_users.get_pubkeys(user_id, key_type="ssh")):
+            self.git_repo.import_ssh_keys(email_addr, ssh_keys)
+            return True
+        return False
 
-    private_token = os.environ.get("PRIVATE_TOKEN")
-    gitlab_key_fetcher = GitLabGPGKeyFetcher(private_token=private_token)
-    gpg_instance = gnupg.GPG()
-    while True:
-        fetch_output = git_repo.fetch_git_repo(git_fetch_depth)
-        regx_search = re.search(FETCH_NO_NEW_COMMITS_REGEX, fetch_output)
-        if regx_search and git_fetch_depth == INITIAL_GIT_FETCH_DEPTH:
-            err_msg = "No new commits found on server"
-            logger.error(err_msg)
-            sys.exit(err_msg)
-        elif regx_search or git_fetch_depth >= GIT_FETCH_DEPTH_LIMIT:
-            logger.error("Cannot find a verified commit in last %s commits", git_fetch_depth)
-            break
+    def run(self) -> None:
+        git_fetch_depth = INITIAL_GIT_FETCH_DEPTH
+        while git_fetch_depth < GIT_FETCH_DEPTH_LIMIT:
+            # Fetch commits
+            commits_fetched = self.git_repo.fetch(git_fetch_depth)
+            if not commits_fetched:
+                # Only exit in first iteration if there is a valid checkout
+                if git_fetch_depth == INITIAL_GIT_FETCH_DEPTH and self.git_repo.repo.head.is_valid():
+                    logger.info("No new commits found on server")
+                    return
+                if git_fetch_depth > INITIAL_GIT_FETCH_DEPTH:
+                    break
 
-        emails = git_repo.get_commiter_email(default_remote_branch)
-        for e in emails:
-            signed_commit_sha = process_committer_email(
-                e,
-                git_repo,
-                gitlab_key_fetcher,
-                gpg_instance,
-                default_remote_branch,
-                gpg_keys_imported=gpg_keys_imported,
-                gpg_keys_not_found=gpg_keys_not_found,
-            )
-            if signed_commit_sha:
-                logger.info("Got Signed Commit SHA: %s", signed_commit_sha)
-                repo.git.checkout(signed_commit_sha)
+            # Import keys
+            imported_new_keys = False
+            if not self.args.no_key_sync:
+                new_email_addrs = self.git_repo.get_committer_email_addrs() - self.processed_email_addrs
+                for email_addr in new_email_addrs:
+                    new_user_ids = self.gitlab_users.get_user_ids(email_addr) - self.processed_user_ids
+                    for user_id in new_user_ids:
+                        imported_new_keys |= self._sync_gpg_keys(user_id)
+                        imported_new_keys |= self._sync_ssh_keys(user_id, email_addr)
+                    self.processed_user_ids |= new_user_ids
+                self.processed_email_addrs |= new_email_addrs
+
+            # Check out commit
+            if (self.args.no_key_sync or imported_new_keys) and (
+                sha := self.git_repo.checkout_latest_signed_commit(self.args.key_types)
+            ):
+                logger.info("Checked out signed commit SHA: %s", sha)
                 return
 
-        git_fetch_depth = min(git_fetch_depth * 2, GIT_FETCH_DEPTH_LIMIT)
-
-
-def process_committer_email(
-    email: str,
-    git_repo: GitRepoVerifier,
-    gitlab_key_fetcher: GitLabGPGKeyFetcher,
-    gpg_instance: gnupg.GPG,
-    default_remote_branch: str | None,
-    *,
-    gpg_keys_imported: set[str],
-    gpg_keys_not_found: set[str],
-) -> str | None:
-    """Process a single committer's email, importing GPG keys and checking for a signed commit."""
-    if email in gpg_keys_imported:
-        logger.debug("GPG Keys already Imported for %s", email)
-        return None
-    if email in gpg_keys_not_found:
-        logger.debug("GPG Keys not found for %s", email)
-        return None
-
-    unique_ids = gitlab_key_fetcher.fetch_user_uid(email)
-    imported_any = False
-    for uid in unique_ids:
-        gpg_key = gitlab_key_fetcher.get_gpg_key_by_uid(uid)
-        if gpg_key:
-            import_result = gpg_instance.import_keys(gpg_key)
-            regx_search = re.search(r"gpg: no valid OpenPGP data found", import_result.stderr)
-            if import_result.returncode == 0 and not regx_search:
-                imported_any = True
-            else:
-                logger.error("no valid OpenPGP data found for uid: %s", uid)
-
-    if imported_any:
-        gpg_keys_imported.add(email)
-        return git_repo.get_signed_commit_sha(default_remote_branch)
-
-    gpg_keys_not_found.add(email)
-    return None
+            # Let's try again with more commits
+            git_fetch_depth = min(git_fetch_depth * 2, GIT_FETCH_DEPTH_LIMIT)
+        fatal_error(f"Cannot find a signed commit in last {git_fetch_depth} commits")
 
 
 if __name__ == "__main__":
-    main()
+    main = Main()
+    main.run()

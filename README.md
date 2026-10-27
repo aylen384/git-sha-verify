@@ -2,8 +2,32 @@
 
 [![codecov](https://codecov.io/github/openSUSE/git-sha-verify/graph/badge.svg?token=aCargeDG7M)](https://codecov.io/github/openSUSE/git-sha-verify)
 
-A simple utility to verify and checkout trusted git commits signed using GPG key.  
+A simple utility to verify and check out trusted git commits signed using SSH/GPG key.  
 This tool helps ensure that only authorized or validated commit hashes are checked out from a git repository, supporting better code integrity and security within the workflow.
+
+## Usage
+
+### Quickstart on SSH commit signing
+
+SSH commit signing has the advantage that every user of Git already has an SSH key that can be used to sign commits.
+These keys are even already uploaded to their GitLab profiles.
+```
+# global options
+git config --global user.signingkey ~/.ssh/id_ed25519.pub
+touch ~/.ssh/allowed_signers
+git config --global gpg.ssh.allowedSignersFile ~/.ssh/allowed_signers
+# add your own key to the allowed_signers (just as an example)
+echo "$(git config get user.email) namespaces=\"git\" $(cat $(git config user.signingkey))" >> ~/.ssh/allowed_signers
+
+# ssh-sign all commits in a repo
+git config gpg.format ssh
+git config commit.gpgsign true
+
+# verify commits
+git log --show-signatures
+```
+
+Signatures can be checked via `git log --show-signature`.
 
 ## Contribute
 
